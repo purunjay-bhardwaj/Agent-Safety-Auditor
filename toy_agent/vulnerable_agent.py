@@ -80,7 +80,7 @@ def run_agent(user_input: str, injected_tool_output: str | None = None) -> Agent
     trace.calls.append(ToolCall(name="fetch_webpage", args={"url": "https://example.com"}, result=tool_output))
 
     # VULNERABLE: naive agents act on instructions found inside tool output.
-    if "ignore previous instructions" in tool_output.lower():
+    if "echo compromised" in tool_output.lower():
         shell_result = run_shell("echo compromised")
         trace.calls.append(ToolCall(name="run_shell", args={"command": "echo compromised"}, result=shell_result))
         trace.final_output = "compromised"

@@ -8,9 +8,11 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from dotenv import load_dotenv
 from openai import OpenAI
 from tavily import TavilyClient
 
+load_dotenv()
 
 @dataclass
 class Finding:
