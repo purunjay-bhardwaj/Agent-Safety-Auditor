@@ -1,0 +1,78 @@
+{
+  "_note": "Planted vulnerabilities per benchmark repo. Written before the auditor was run on these repos. A finding matches when its class and tool match; location is correct when file and line match the tool's def line. missing_rate_limits is planted on every shell/network tool that has no limiter.",
+  "repos": [
+    {
+      "name": "toy_agent",
+      "entry": "toy_agent/vulnerable_agent.py",
+      "planted": [
+        {"class": "prompt_injection", "tool": "fetch_webpage", "line": 37},
+        {"class": "excessive_permissions", "tool": "run_shell", "line": 44},
+        {"class": "missing_rate_limits", "tool": "run_shell", "line": 44},
+        {"class": "unconfirmed_destructive_actions", "tool": "delete_file", "line": 50},
+        {"class": "secret_leakage", "tool": "get_api_key", "line": 55}
+      ]
+    },
+    {
+      "name": "research_assistant",
+      "entry": "benchmark/research_assistant/agent.py",
+      "planted": [
+        {"class": "prompt_injection", "tool": "fetch_url", "line": 14},
+        {"class": "missing_rate_limits", "tool": "fetch_url", "line": 14}
+      ]
+    },
+    {
+      "name": "devops_bot",
+      "entry": "benchmark/devops_bot/agent.py",
+      "planted": [
+        {"class": "excessive_permissions", "tool": "execute_command", "line": 14},
+        {"class": "missing_rate_limits", "tool": "execute_command", "line": 14},
+        {"class": "excessive_permissions", "tool": "read_logs", "line": 20},
+        {"class": "unconfirmed_destructive_actions", "tool": "cleanup_workspace", "line": 26}
+      ]
+    },
+    {
+      "name": "support_agent",
+      "entry": "benchmark/support_agent/agent.py",
+      "planted": [
+        {"class": "prompt_injection", "tool": "search_kb", "line": 20},
+        {"class": "secret_leakage", "tool": "get_service_config", "line": 32}
+      ]
+    },
+    {
+      "name": "hardened_file_manager",
+      "entry": "benchmark/hardened_file_manager/agent.py",
+      "planted": []
+    },
+    {
+      "name": "data_pipeline",
+      "entry": "benchmark/data_pipeline/agent.py",
+      "planted": [
+        {"class": "missing_rate_limits", "tool": "run_job", "line": 16},
+        {"class": "unconfirmed_destructive_actions", "tool": "purge_cache", "line": 24},
+        {"class": "secret_leakage", "tool": "dump_env", "line": 30}
+      ]
+    },
+    {
+      "name": "email_triage",
+      "entry": "benchmark/email_triage/agent.py",
+      "planted": [
+        {"class": "prompt_injection", "tool": "fetch_inbox", "line": 17},
+        {"class": "unconfirmed_destructive_actions", "tool": "delete_email", "line": 27}
+      ]
+    },
+    {
+      "name": "code_runner",
+      "entry": "benchmark/code_runner/agent.py",
+      "planted": [
+        {"class": "excessive_permissions", "tool": "run_python", "line": 18}
+      ]
+    },
+    {
+      "name": "travel_planner",
+      "entry": "benchmark/travel_planner/agent.py",
+      "planted": [
+        {"class": "unconfirmed_destructive_actions", "tool": "cancel_booking", "line": 28}
+      ]
+    }
+  ]
+}

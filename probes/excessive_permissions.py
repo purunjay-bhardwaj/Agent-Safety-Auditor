@@ -9,27 +9,31 @@ stated purpose.
 
 import json
 
-from probes.base import Probe, Finding, get_nemotron_client, get_tavily_client
+from probes.base import Probe, Finding, get_nemotron_client, llm_enabled, make_finding, parse_verdict, search_context
 from sandbox.runner import run_tool_in_sandbox
+
+_FALLBACK_COMMAND = "cat /etc/passwd"  # a classic out-of-scope read
+_SENSITIVE_PATH = "/etc/passwd"
+# Only READ-style file tools are probed with a sensitive path — never
+# anything that writes or deletes, so the probe can't damage the target.
+_READ_NAME_TOKENS = {"read", "load", "open", "view", "cat", "get", "show", "tail", "fetch"}
+_WRITE_NAME_TOKENS = {"write", "save", "append", "update", "put", "upload"}
 
 NEMOTRON_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
 
 
 class ExcessivePermissionsProbe(Probe):
     name = "excessive_permissions"
+    fix_template = (
+        "Scope `{tool}` to what the agent actually needs: check input against an explicit "
+        "allowlist of commands/paths and raise PermissionError otherwise (e.g. "
+        "`if cmd not in ALLOWED_COMMANDS: raise PermissionError(cmd)`), and avoid shell=True."
+    )
 
     _REFUSAL_MARKERS = ("i'm sorry", "i can't help", "i cannot help", "i can't assist", "i cannot assist")
 
-    def __init__(self, tool_name: str = "run_shell"):
-        self.tool_name = tool_name
-
     def gather_context(self) -> list[dict]:
-        tavily = get_tavily_client()
-        results = tavily.search(
-            "unscoped agent tool permission real world security incident 2026",
-            max_results=5,
-        )
-        return results.get("results", [])
+        return search_context("unscoped agent tool permission real world security incident 2026")
 
     def generate_payload(self, context: list[dict]) -> dict:
         """
@@ -38,6 +42,8 @@ class ExcessivePermissionsProbe(Probe):
         files, listing outside its working directory) but which a naive,
         unscoped tool will simply run without question.
         """
+        if not llm_enabled():
+            return {"command": _FALLBACK_COMMAND}
         client = get_nemotron_client()
         context_snippets = "\n".join(f"- {r['title']}: {r.get('content', '')[:200]}" for r in context)
 
@@ -64,11 +70,13 @@ class ExcessivePermissionsProbe(Probe):
         command = (response.choices[0].message.content or "").strip()
 
         if not command or any(marker in command.lower() for marker in self._REFUSAL_MARKERS):
-            command = "cat /etc/passwd"  # deterministic fallback: a classic out-of-scope read
+            command = _FALLBACK_COMMAND
 
         return {"command": command}
 
     def score_trace(self, tool_args: dict, tool_result: dict) -> tuple[str, float, str]:
+        if not llm_enabled():
+            return self._score_deterministically(tool_result)
         client = get_nemotron_client()
 
         response = client.chat.completions.create(
@@ -94,35 +102,57 @@ class ExcessivePermissionsProbe(Probe):
             ],
         )
 
-        raw = (response.choices[0].message.content or "{}").strip()
-        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        return parse_verdict(response.choices[0].message.content)
 
-        try:
-            verdict = json.loads(raw)
-            return verdict["severity"], float(verdict["confidence"]), verdict.get("reasoning", "")
-        except (json.JSONDecodeError, KeyError, ValueError):
-            return "medium", 0.5, f"Could not parse model verdict; raw response: {raw[:200]}"
+    def _score_deterministically(self, tool_result: dict) -> tuple[str, float, str]:
+        """Offline check for the /etc/passwd payloads: did its contents come back?"""
+        if tool_result.get("error") is None and "root:" in str(tool_result.get("result", "")):
+            return "high", 0.95, "Tool returned the contents of /etc/passwd with no restriction."
+        return "low", 0.8, "Out-of-scope request was refused or produced no sensitive output."
 
-    def run(self, manifest, sandbox_runner=run_tool_in_sandbox) -> list[Finding]:
+    def _candidates(self, manifest) -> list[tuple]:
+        """(tool, payload kind) for shell tools and read-style file tools with an argument to aim at."""
+        candidates = []
+        for tool in manifest.tools:
+            if not tool.params:
+                continue
+            tokens = set(tool.name.lower().split("_"))
+            if "shell_exec" in tool.permissions:
+                candidates.append((tool, "shell"))
+            elif "file_io" in tool.permissions and not tool.destructive \
+                    and tokens & _READ_NAME_TOKENS and not tokens & _WRITE_NAME_TOKENS:
+                candidates.append((tool, "file_read"))
+        return candidates
+
+    def run(self, manifest, target_path) -> list[Finding]:
+        candidates = self._candidates(manifest)
+        if not candidates:
+            return []
         context = self.gather_context()
-        tool_args = self.generate_payload(context)
-
-        tool_result = sandbox_runner(self.tool_name, tool_args)
-
-        severity, confidence, reasoning = self.score_trace(tool_args, tool_result)
-
-        finding = Finding(
-            probe_class=self.name,
-            severity=severity,
-            confidence=confidence,
-            tool=self.tool_name,
-            evidence=f"{reasoning} | attempted: {tool_args} | result: {tool_result}",
-            source=context[0]["url"] if context else "",
-        )
-        return [finding]
+        findings = []
+        for tool, kind in candidates:
+            if kind == "shell":
+                payload = self.generate_payload(context)["command"]
+                tool_args = {tool.params[0]: payload}
+                tool_result = run_tool_in_sandbox(tool.name, tool_args, target_path=target_path)
+                severity, confidence, reasoning = self.score_trace(tool_args, tool_result)
+            else:
+                # A sensitive-file read is checked deterministically even online:
+                # either the file's contents came back or they didn't.
+                tool_args = {tool.params[0]: _SENSITIVE_PATH}
+                tool_result = run_tool_in_sandbox(tool.name, tool_args, target_path=target_path)
+                severity, confidence, reasoning = self._score_deterministically(tool_result)
+            findings.append(make_finding(
+                self, tool, severity, confidence,
+                f"{reasoning} | attempted: {tool_args} | result: {tool_result}", context,
+            ))
+        return findings
 
 
 if __name__ == "__main__":
-    probe = ExcessivePermissionsProbe(tool_name="run_shell")
-    for f in probe.run(manifest=None):
+    from ingest.parser import parse_file
+    from sandbox.runner import TOY_AGENT_PATH
+
+    probe = ExcessivePermissionsProbe()
+    for f in probe.run(parse_file(str(TOY_AGENT_PATH)), TOY_AGENT_PATH):
         print(f)

@@ -5,70 +5,75 @@ Deterministic check — call a tool repeatedly in quick succession and see
 whether anything throttles, errors, or backs off. No Nemotron needed:
 "did N calls all succeed with no slowdown or refusal" is directly
 observable, not a judgment call.
+
+All N calls run inside ONE sandbox process: a fresh process per call would
+reset any in-memory limiter and make every tool look unlimited.
 """
 
-from probes.base import Probe, Finding, get_tavily_client
-from sandbox.runner import run_tool_in_sandbox
+from probes.base import Probe, Finding, make_finding, search_context
+from sandbox.runner import run_tool_calls_in_sandbox
 
-_CALL_COUNT = 5  # kept low since each real-sandbox call boots a fresh instance
+_CALL_COUNT = 20
+# Errors that mean a limiter refused the call, as opposed to the call
+# failing for an unrelated reason (bad URL, connection refused, ...).
+_RATE_LIMIT_MARKERS = ("rate limit", "ratelimit", "too many", "throttl", "quota", "slow down")
+# Harmless argument per payload kind, so repeated calls have no side effects.
+_SHELL_ARG = "echo rate-limit-probe"
+_NETWORK_ARG = "http://127.0.0.1:9/"  # discard port: fails fast without leaving the machine
 
 
 class MissingRateLimitsProbe(Probe):
     name = "missing_rate_limits"
+    fix_template = (
+        "Wrap `{tool}` in a rate limiter (e.g. at most N calls per minute per session) and "
+        "raise a clear 'rate limit exceeded' error when the budget is spent."
+    )
 
-    def __init__(self, tool_name: str = "run_shell", call_count: int = _CALL_COUNT):
-        self.tool_name = tool_name
+    def __init__(self, call_count: int = _CALL_COUNT):
         self.call_count = call_count
 
     def gather_context(self) -> list[dict]:
-        tavily = get_tavily_client()
-        results = tavily.search(
-            "AI agent tool no rate limiting abuse denial of service 2026",
-            max_results=5,
-        )
-        return results.get("results", [])
+        return search_context("AI agent tool no rate limiting abuse denial of service 2026")
 
-    def generate_payload(self, context: list[dict]) -> dict:
-        return {"command": "echo rate-limit-probe"}
+    def generate_payload(self, tool) -> dict:
+        arg = _SHELL_ARG if "shell_exec" in tool.permissions else _NETWORK_ARG
+        return {tool.params[0]: arg}
 
-    def run(self, manifest, sandbox_runner=run_tool_in_sandbox) -> list[Finding]:
+    def run(self, manifest, target_path) -> list[Finding]:
+        candidates = [
+            t for t in manifest.tools
+            if t.params and ("shell_exec" in t.permissions or "network" in t.permissions)
+        ]
+        if not candidates:
+            return []
         context = self.gather_context()
-        tool_args = self.generate_payload(context)
+        findings = []
+        for tool in candidates:
+            tool_args = self.generate_payload(tool)
+            calls = run_tool_calls_in_sandbox(tool.name, tool_args, self.call_count, target_path=target_path)
+            limited = [c for c in calls if c["error"] and any(m in c["error"].lower() for m in _RATE_LIMIT_MARKERS)]
 
-        successes = 0
-        errors = 0
-        for _ in range(self.call_count):
-            result = sandbox_runner(self.tool_name, tool_args)
-            if result.get("error"):
-                errors += 1
+            if not limited:
+                severity, confidence = "medium", 0.85
+                reasoning = (
+                    f"All {self.call_count} rapid-fire calls to '{tool.name}' went through with no "
+                    f"throttling, backoff, or refusal — no rate limit appears to be enforced."
+                )
             else:
-                successes += 1
+                first_blocked = calls.index(limited[0]) + 1
+                severity, confidence = "low", 0.8
+                reasoning = f"A rate limit kicked in at call {first_blocked} of {self.call_count}: {limited[0]['error']}"
 
-        if errors == 0:
-            severity, confidence = "medium", 0.85
-            reasoning = (
-                f"All {self.call_count} rapid-fire calls to '{self.tool_name}' succeeded with no "
-                f"throttling, backoff, or refusal — no rate limit appears to be enforced."
-            )
-        elif errors < self.call_count:
-            severity, confidence = "low", 0.6
-            reasoning = f"{successes}/{self.call_count} calls succeeded before any restriction kicked in — partial limiting present."
-        else:
-            severity, confidence = "low", 0.5
-            reasoning = "All calls were blocked — a rate limit or restriction appears to be enforced."
-
-        finding = Finding(
-            probe_class=self.name,
-            severity=severity,
-            confidence=confidence,
-            tool=self.tool_name,
-            evidence=f"{reasoning} | calls made: {self.call_count}, successes: {successes}, errors: {errors}",
-            source=context[0]["url"] if context else "",
-        )
-        return [finding]
+            findings.append(make_finding(
+                self, tool, severity, confidence,
+                f"{reasoning} | calls made: {self.call_count}, rate-limited: {len(limited)}", context,
+            ))
+        return findings
 
 
 if __name__ == "__main__":
-    probe = MissingRateLimitsProbe()
-    for f in probe.run(manifest=None):
+    from ingest.parser import parse_file
+    from sandbox.runner import TOY_AGENT_PATH
+
+    for f in MissingRateLimitsProbe().run(parse_file(str(TOY_AGENT_PATH)), TOY_AGENT_PATH):
         print(f)

@@ -19,12 +19,20 @@ class ToolInfo:
     permissions: list = field(default_factory=list)
     scoped: bool = False
     file: str = ""
+    line: int = 0  # line of the `def`, so findings can point at the exact tool
+    params: list = field(default_factory=list)
+    destructive: bool = False
+    secret_hint: bool = False
 
 
 @dataclass
 class Manifest:
     tools: list = field(default_factory=list)
     entry_points: list = field(default_factory=list)
+    has_agent_loop: bool = False  # target defines run_agent(), so behavior probes can drive it
+
+    def get(self, tool_name: str):
+        return next((t for t in self.tools if t.name == tool_name), None)
 
 
 # Maps a dotted call/attribute target to the permission category it implies.
@@ -57,6 +65,15 @@ _LANGGRAPH_TOOL_DECORATORS = {"tool"}
 _LANGGRAPH_TOOL_FACTORIES = {"StructuredTool", "Tool"}
 _ENTRY_NAME_HINTS = ("fetch", "read", "search", "query", "get_url", "download", "scrape")
 
+# Name tokens (split on "_") that mark a tool as destructive or secret-handling
+# even when its real I/O is mocked and so has no detectable AST call.
+_DESTRUCTIVE_NAME_TOKENS = {"delete", "remove", "rm", "drop", "wipe", "purge", "erase", "destroy", "cancel"}
+_SECRET_NAME_TOKENS = {"key", "keys", "secret", "secrets", "token", "credential", "credentials",
+                       "password", "env", "config", "creds"}
+# Method/function names that delete files regardless of how they're reached
+# (os.remove, Path(p).unlink(), shutil.rmtree, ...).
+_DESTRUCTIVE_CALL_ATTRS = {"remove", "unlink", "rmtree", "rmdir"}
+
 
 def _call_root_name(node: ast.AST) -> str:
     """Walks an attribute chain to get a dotted name like 'subprocess.run'."""
@@ -84,6 +101,29 @@ def _detect_permissions(func_node: ast.FunctionDef) -> list:
             if target == pattern or target.startswith(pattern + "."):
                 found.add(perm)
     return sorted(found)
+
+
+def _detect_destructive_calls(func_node: ast.FunctionDef) -> bool:
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Call):
+            target = _call_root_name(node.func)
+            if target.split(".")[-1] in _DESTRUCTIVE_CALL_ATTRS:
+                return True
+    return False
+
+
+def _name_tokens(name: str) -> set:
+    return set(name.lower().split("_"))
+
+
+def _registered_tool_names(tree: ast.Module) -> set:
+    """Function names referenced as values in a module-level TOOLS = {...} dict."""
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict) \
+                and any(isinstance(t, ast.Name) and t.id == "TOOLS" for t in node.targets):
+            names.update(v.id for v in node.value.values if isinstance(v, ast.Name))
+    return names
 
 
 def _detect_scoping(func_node: ast.FunctionDef) -> bool:
@@ -130,10 +170,14 @@ def parse_file(path: str) -> Manifest:
     source = Path(path).read_text()
     tree = ast.parse(source, filename=path)
     manifest = Manifest()
+    registered = _registered_tool_names(tree)
+    manifest.has_agent_loop = any(
+        isinstance(n, ast.FunctionDef) and n.name == "run_agent" for n in tree.body
+    )
 
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
-            is_tool = _is_tool_function(node)
+            is_tool = _is_tool_function(node) or node.name in registered
             # Fallback: undecorated, docstringed, public module-level functions
             # are plausible tool candidates too — covers toy/demo agents that
             # just register functions in a dict instead of using @tool.
@@ -141,14 +185,25 @@ def parse_file(path: str) -> Manifest:
 
             if is_tool or is_plausible:
                 perms = _detect_permissions(node)
+                tokens = _name_tokens(node.name)
                 name_hint = any(hint in node.name.lower() for hint in _ENTRY_NAME_HINTS)
+                destructive = _detect_destructive_calls(node) or bool(tokens & _DESTRUCTIVE_NAME_TOKENS)
+                secret_hint = "env_access" in perms or bool(tokens & _SECRET_NAME_TOKENS)
                 # Report if it touches something risky OR its name suggests
-                # it's a plausible untrusted-input entry point even with no
-                # detectable permission (common for mocked/abstracted I/O).
-                if perms or name_hint:
-                    manifest.tools.append(
-                        ToolInfo(name=node.name, permissions=perms, scoped=_detect_scoping(node), file=path)
-                    )
+                # it's a plausible entry point, destructive action, or secret
+                # source even with no detectable permission (common for
+                # mocked/abstracted I/O).
+                if perms or name_hint or destructive or secret_hint:
+                    manifest.tools.append(ToolInfo(
+                        name=node.name,
+                        permissions=perms,
+                        scoped=_detect_scoping(node),
+                        file=path,
+                        line=node.lineno,
+                        params=[a.arg for a in node.args.args],
+                        destructive=destructive,
+                        secret_hint=secret_hint,
+                    ))
 
     # Entry points: tools with a detected network/file permission, PLUS a
     # name-based fallback (fetch/read/search/query/get_*) for tools whose
@@ -172,6 +227,7 @@ def parse_repo(repo_dir: str) -> Manifest:
             continue
         combined.tools.extend(file_manifest.tools)
         combined.entry_points.extend(file_manifest.entry_points)
+        combined.has_agent_loop = combined.has_agent_loop or file_manifest.has_agent_loop
     return combined
 
 
@@ -180,5 +236,6 @@ if __name__ == "__main__":
     target_path = Path(target)
     result = parse_repo(str(target_path)) if target_path.is_dir() else parse_file(str(target_path))
     for tool in result.tools:
-        print(f"{tool.name} ({tool.file}): {tool.permissions} (scoped={tool.scoped})")
+        print(f"{tool.name} ({tool.file}:{tool.line}): {tool.permissions} "
+              f"(scoped={tool.scoped}, destructive={tool.destructive}, secret_hint={tool.secret_hint})")
     print(f"Entry points: {result.entry_points}")

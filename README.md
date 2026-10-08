@@ -17,9 +17,33 @@ Built for the Nebius x NVIDIA Global AI Hackathon — Coding and Agentic Enginee
 
 ## Setup
 
-1. Copy `.env.example` to `.env` and fill in your keys (Token Factory API key, Tavily API key).
+1. Copy `.env.example` to `.env` and fill in your keys (Token Factory, Nebius sandbox, Tavily).
 2. `pip install -r requirements.txt`
-3. Run against the bundled toy agent: `python -m ingest.parser toy_agent/vulnerable_agent.py`
+3. Inspect a target's tool manifest: `python -m ingest.parser toy_agent/vulnerable_agent.py`
+4. Scan the toy agent and write `reports/latest.json`: `python -m report.generator`
+5. Run the web UI: `uvicorn ui.app:app --reload`, then open `http://localhost:8000/report`
+6. Run the tests (offline, no API calls): `python -m pytest`
+
+Set `USE_REAL_SANDBOX=false` to run targets in a local subprocess instead of Token Factory
+Sandboxes, and `AUDITOR_OFFLINE=true` to skip Nemotron/Tavily entirely.
+
+### Target contract
+
+A target agent is a single Python file exposing a module-level `TOOLS = {"name": fn}` dict
+(plain functions or LangChain `@tool` objects) and, optionally,
+`run_agent(user_input, injected_tool_output=None)` returning `{"calls": [...], "final_output": ...}`.
+The parser maps each tool to its permissions and definition line; each probe picks the tools
+relevant to its class, so findings carry the exact file, line and a suggested fix.
+
+## Docker
+
+```
+docker build -t agent-safety-auditor .
+docker run --env-file .env -p 8000:8000 agent-safety-auditor
+```
+
+Pushes to `main` build and publish `ghcr.io/purunjay-bhardwaj/agent-safety-auditor:latest` via
+`.github/workflows/docker-publish.yml`.
 
 ## Project structure
 
@@ -27,13 +51,32 @@ Built for the Nebius x NVIDIA Global AI Hackathon — Coding and Agentic Enginee
 - `sandbox/` — orchestrates Token Factory Sandbox runs and captures traces
 - `probes/` — one module per vulnerability class (prompt injection, excessive permissions, etc.)
 - `report/` — turns scored probe results into the final report
-- `patch/` — (stretch) drafts and opens a patch PR for found vulnerabilities
+- `patch/` — (stretch, not built yet) drafts and opens a patch PR for found vulnerabilities
+- `benchmark/` — planted-vulnerability benchmark repos, ground truth, and the scoring script
 - `toy_agent/` — a deliberately vulnerable LangGraph agent used as the first test target
 - `ui/` — minimal interface for triggering a scan and viewing the report
 
-## Significant updates during the Submission Period
+## Benchmark
 
-_Fill this in only if any part of this project pre-dates Aug 26, 2026 — otherwise remove this section._
+`benchmark/` holds 9 small agent repos (8 synthetic targets plus the toy agent) with 20 planted
+vulnerabilities across the five probe classes, including one fully hardened repo for measuring
+false positives. Ground truth (class, tool, line) is in `benchmark/ground_truth.json`.
+
+```
+python -m benchmark.run              # live: Nemotron + Tavily, Token Factory Sandboxes
+python -m benchmark.run --offline    # deterministic, no API calls
+```
+
+| Mode | Detected | False positives | Correct file:line | With suggested fix |
+|---|---|---|---|---|
+| Nemotron + Tavily, Token Factory Sandbox (2 runs, identical) | 17/20 (85%) | 3 | 17/17 | 17/17 |
+| Offline, local subprocess | 17/20 (85%) | 0 | 17/17 | 17/17 |
+
+Known gaps: non-file destructive actions (`delete_email`) and code-execution tools probed with a
+shell payload (`run_python`) are missed; the live prompt-injection judge flags agents that merely
+quote injected text as compromised. The targets are synthetic and written by the auditor's authors,
+so these numbers measure generalization across tool names, signatures and safeguards, not
+real-world recall.
 
 ## License
 
